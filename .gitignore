@@ -16,6 +16,7 @@ pgo-data.profdata
 **/proof-with-io.bin
 **/program.bin
 **/stdin.bin
+proofs/rwa-dex-batch/
 **/node_modules
 
 # Example fibonacci groth16 / plonk proofs
