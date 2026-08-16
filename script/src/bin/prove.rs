@@ -1,8 +1,12 @@
-use std::{env, fs, path::PathBuf, time::Instant};
+use std::{
+    env, fs,
+    path::PathBuf,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 use serde::{Deserialize, Serialize};
-use sp1_sdk::{include_elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey, SP1Stdin};
+use sp1_sdk::{include_elf, HashableKey, Prover, ProverClient, ProvingKey, SP1Stdin};
 use tiny_keccak::{Hasher, Keccak};
 
 const ELF: sp1_sdk::Elf = include_elf!("rwa-dex-batch-program");
@@ -10,6 +14,7 @@ const CHAIN_ID: u64 = 421614;
 const TFUND: [u8; 20] = hex_bytes("4f955D0B96C20e88E5da6f632057e0BfA62c871e");
 const USDC: [u8; 20] = hex_bytes("17B9002eaeAeD3734C357C9662DEA5DD49aAA2cE");
 const EXTENSION: [u8; 20] = hex_bytes("ed281B3a066A5818FE119E33fb1e1719185a8a25");
+const IDENTITY_REGISTRY: [u8; 20] = hex_bytes("a8FAe60a6823A7e2EEe1e9dc73625537DE4E1ac6");
 
 const fn hex_nibble(value: u8) -> u8 {
     match value {
@@ -52,6 +57,7 @@ struct BatchInput {
     verifying_contract: [u8; 20],
     tfund: [u8; 20],
     usdc: [u8; 20],
+    identity_registry: [u8; 20],
     kyc_root: [u8; 32],
     current_timestamp: u64,
     orders: Vec<Order>,
@@ -154,8 +160,9 @@ fn sample_input() -> BatchInput {
         verifying_contract: EXTENSION,
         tfund: TFUND,
         usdc: USDC,
+        identity_registry: IDENTITY_REGISTRY,
         kyc_root,
-        current_timestamp: 0,
+        current_timestamp: batch_timestamp(),
         orders: Vec::new(),
     };
     let domain_separator = hash_domain(&domain_input);
@@ -186,6 +193,17 @@ fn sample_input() -> BatchInput {
     };
     buy.signature = sign_order(&buy, &buyer_key, &domain_separator);
     BatchInput { orders: vec![sell, buy], ..domain_input }
+}
+
+fn batch_timestamp() -> u64 {
+    env::var("BATCH_TIMESTAMP")
+        .map(|value| value.parse().expect("BATCH_TIMESTAMP must be a u64"))
+        .unwrap_or_else(|_| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before Unix epoch")
+                .as_secs()
+        })
 }
 
 fn load_input() -> BatchInput {
@@ -252,7 +270,7 @@ async fn main() {
 
     let client = ProverClient::from_env().await;
     let setup_start = Instant::now();
-    let proving_key: ProvingKey = client.setup(ELF).await.expect("SP1 setup failed");
+    let proving_key = client.setup(ELF).await.expect("SP1 setup failed");
     let setup_ms = setup_start.elapsed().as_millis();
 
     let (_, execution_report) =
@@ -290,6 +308,18 @@ async fn main() {
         adapter_calldata(&proof_bytes, public_values),
     )
     .expect("failed to write adapter calldata");
+    fs::write(output_dir.join("proof.hex"), hex::encode(&proof_bytes))
+        .expect("failed to write proof hex");
+    fs::write(
+        output_dir.join("verifier-calldata.hex"),
+        hex::encode(verifier_calldata(vkey, public_values, &proof_bytes)),
+    )
+    .expect("failed to write verifier calldata hex");
+    fs::write(
+        output_dir.join("adapter-calldata.hex"),
+        hex::encode(adapter_calldata(&proof_bytes, public_values)),
+    )
+    .expect("failed to write adapter calldata hex");
 
     let metrics = format!(
         "{{\n  \"proof_mode\": \"{}\",\n  \"setup_ms\": {},\n  \"proving_ms\": {},\n  \"cycles\": {},\n  \"proof_bytes\": {},\n  \"public_values_bytes\": {},\n  \"verifier_calldata_bytes\": {},\n  \"adapter_calldata_bytes\": {}\n}}\n",

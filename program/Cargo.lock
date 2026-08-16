@@ -817,6 +817,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "rwa-dex-batch-program"
 version = "0.1.0"
 dependencies = [
+ "crypto-bigint",
  "k256",
  "serde",
  "sp1-zkvm",

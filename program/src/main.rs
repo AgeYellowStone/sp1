@@ -2,11 +2,13 @@
 
 sp1_zkvm::entrypoint!(main);
 
+use crypto_bigint::{Encoding, NonZero, U256, U512};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher, Keccak};
 
 const MAX_ORDERS: usize = 64;
+const MAX_KYC_PROOF_DEPTH: usize = 64;
 const ORDER_TYPE: &[u8] = b"Order(uint256 salt,address maker,address receiver,address makerAsset,address takerAsset,uint256 makingAmount,uint256 takingAmount,uint256 makerTraits)";
 const DOMAIN_TYPE: &[u8] =
     b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
@@ -33,6 +35,7 @@ pub struct BatchInput {
     pub verifying_contract: [u8; 20],
     pub tfund: [u8; 20],
     pub usdc: [u8; 20],
+    pub identity_registry: [u8; 20],
     pub kyc_root: [u8; 32],
     pub current_timestamp: u64,
     pub orders: Vec<Order>,
@@ -42,8 +45,8 @@ pub struct BatchInput {
 struct Trade {
     seller_index: u32,
     buyer_index: u32,
-    tfund_amount: u128,
-    usdc_amount: u128,
+    tfund_amount: U256,
+    usdc_amount: U256,
 }
 
 fn keccak256(bytes: &[u8]) -> [u8; 32] {
@@ -100,13 +103,27 @@ fn hash_order(order: &Order, domain_separator: &[u8; 32]) -> [u8; 32] {
 }
 
 fn recover_maker(order_hash: &[u8; 32], signature: &[u8]) -> [u8; 20] {
-    assert_eq!(signature.len(), 65, "signature must be 65 bytes");
-    let mut recovery_byte = signature[64];
-    let signature = Signature::from_slice(&signature[..64]).unwrap();
-    if recovery_byte >= 27 {
-        recovery_byte -= 27;
-    }
+    let mut signature_bytes = [0u8; 64];
+    let recovery_byte = match signature.len() {
+        65 => {
+            signature_bytes.copy_from_slice(&signature[..64]);
+            let mut recovery_byte = signature[64];
+            if recovery_byte >= 27 {
+                recovery_byte -= 27;
+            }
+            recovery_byte
+        }
+        64 => {
+            signature_bytes[..32].copy_from_slice(&signature[..32]);
+            signature_bytes[32..].copy_from_slice(&signature[32..]);
+            let recovery_byte = signature_bytes[32] >> 7;
+            signature_bytes[32] &= 0x7f;
+            recovery_byte
+        }
+        _ => panic!("signature must be 64 or 65 bytes"),
+    };
     assert!(recovery_byte <= 1, "invalid Ethereum recovery id");
+    let signature = Signature::from_slice(&signature_bytes).unwrap();
     let recovery_id = RecoveryId::from_byte(recovery_byte).unwrap();
     let verifying_key =
         VerifyingKey::recover_from_prehash(order_hash, &signature, recovery_id).unwrap();
@@ -131,15 +148,55 @@ fn verify_kyc(root: &[u8; 32], address: &[u8; 20], proof: &[[u8; 32]]) {
     assert_eq!(node, *root, "KYC Merkle proof is invalid");
 }
 
-fn amount(word: &[u8; 32]) -> u128 {
-    assert!(word[..16].iter().all(|byte| *byte == 0), "amount exceeds supported u128 range");
-    u128::from_be_bytes(word[16..].try_into().unwrap())
+fn amount(word: &[u8; 32]) -> U256 {
+    U256::from_be_slice(word)
 }
 
-fn amount_word(value: u128) -> [u8; 32] {
-    let mut word = [0u8; 32];
-    word[16..].copy_from_slice(&value.to_be_bytes());
-    word
+fn amount_word(value: U256) -> [u8; 32] {
+    value.to_be_bytes()
+}
+
+fn widen(value: U256) -> U512 {
+    let mut bytes = [0u8; 64];
+    bytes[32..].copy_from_slice(&value.to_be_bytes());
+    U512::from_be_slice(&bytes)
+}
+
+fn narrow(value: U512) -> Option<U256> {
+    if value > widen(U256::MAX) {
+        return None;
+    }
+    let bytes = value.to_be_bytes();
+    Some(U256::from_be_slice(&bytes[32..]))
+}
+
+fn product(left: U256, right: U256) -> U512 {
+    left.mul(&right)
+}
+
+fn floor_ratio(numerator: U256, multiplier: U256, denominator: U256) -> Option<U256> {
+    assert!(denominator != U256::ZERO, "division by zero");
+    let (quotient, _) =
+        product(numerator, multiplier).div_rem(&NonZero::new(widen(denominator)).unwrap());
+    narrow(quotient)
+}
+
+fn ceil_ratio(numerator: U256, multiplier: U256, denominator: U256) -> Option<U256> {
+    assert!(denominator != U256::ZERO, "division by zero");
+    let (mut quotient, remainder) =
+        product(numerator, multiplier).div_rem(&NonZero::new(widen(denominator)).unwrap());
+    if remainder != U512::ZERO {
+        quotient = quotient + U512::ONE;
+    }
+    narrow(quotient)
+}
+
+fn min_amount(left: U256, right: U256) -> U256 {
+    if left < right {
+        left
+    } else {
+        right
+    }
 }
 
 fn expiration(maker_traits: &[u8; 32]) -> u64 {
@@ -185,10 +242,6 @@ fn orderbook_root(hashes: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
-fn ceil_div(numerator: u128, denominator: u128) -> u128 {
-    numerator.checked_add(denominator - 1).unwrap() / denominator
-}
-
 fn build_trades(input: &BatchInput, orders: &[Order]) -> Vec<Trade> {
     let order_count = orders.len();
     let mut remaining_maker =
@@ -204,7 +257,7 @@ fn build_trades(input: &BatchInput, orders: &[Order]) -> Vec<Trade> {
         }
         let seller_making = amount(&seller.making_amount);
         let seller_taking = amount(&seller.taking_amount);
-        assert!(seller_making > 0 && seller_taking > 0);
+        assert!(seller_making > U256::ZERO && seller_taking > U256::ZERO);
 
         for buyer_index in 0..order_count {
             let buyer = &orders[buyer_index];
@@ -216,39 +269,55 @@ fn build_trades(input: &BatchInput, orders: &[Order]) -> Vec<Trade> {
             }
             let buyer_making = amount(&buyer.making_amount);
             let buyer_taking = amount(&buyer.taking_amount);
-            if buyer_making == 0
-                || buyer_taking == 0
-                || remaining_maker[seller_index] == 0
-                || remaining_taker[buyer_index] == 0
+            if buyer_making == U256::ZERO
+                || buyer_taking == U256::ZERO
+                || remaining_maker[seller_index] == U256::ZERO
+                || remaining_taker[buyer_index] == U256::ZERO
             {
                 continue;
             }
 
             // Seller ask <= buyer bid. All arithmetic is checked before entering the proof.
-            let ask_value = seller_taking.checked_mul(buyer_taking).unwrap();
-            let bid_value = buyer_making.checked_mul(seller_making).unwrap();
+            let ask_value = product(seller_taking, buyer_taking);
+            let bid_value = product(buyer_making, seller_making);
             if ask_value > bid_value {
                 continue;
             }
 
-            let buyer_tfund_capacity =
-                remaining_maker[buyer_index].checked_mul(buyer_taking).unwrap() / buyer_making;
-            let tfund_amount = remaining_maker[seller_index]
-                .min(remaining_taker[buyer_index])
-                .min(buyer_tfund_capacity);
-            if tfund_amount == 0 {
+            let Some(seller_tfund_capacity) =
+                floor_ratio(remaining_taker[seller_index], seller_making, seller_taking)
+            else {
+                continue;
+            };
+            let Some(buyer_tfund_capacity) =
+                floor_ratio(remaining_maker[buyer_index], buyer_taking, buyer_making)
+            else {
+                continue;
+            };
+            let tfund_amount = min_amount(
+                min_amount(remaining_maker[seller_index], remaining_taker[buyer_index]),
+                min_amount(seller_tfund_capacity, buyer_tfund_capacity),
+            );
+            if tfund_amount == U256::ZERO {
                 continue;
             }
 
-            let usdc_amount =
-                ceil_div(tfund_amount.checked_mul(seller_taking).unwrap(), seller_making);
-            if usdc_amount == 0 || usdc_amount > remaining_maker[buyer_index] {
+            let Some(usdc_amount) = ceil_ratio(tfund_amount, seller_taking, seller_making) else {
+                continue;
+            };
+            if usdc_amount == U256::ZERO
+                || usdc_amount > remaining_maker[buyer_index]
+                || usdc_amount > remaining_taker[seller_index]
+            {
                 continue;
             }
 
-            remaining_maker[seller_index] -= tfund_amount;
-            remaining_taker[buyer_index] -= tfund_amount;
-            remaining_maker[buyer_index] -= usdc_amount;
+            remaining_maker[seller_index] =
+                remaining_maker[seller_index].wrapping_sub(&tfund_amount);
+            remaining_taker[seller_index] =
+                remaining_taker[seller_index].wrapping_sub(&usdc_amount);
+            remaining_taker[buyer_index] = remaining_taker[buyer_index].wrapping_sub(&tfund_amount);
+            remaining_maker[buyer_index] = remaining_maker[buyer_index].wrapping_sub(&usdc_amount);
             trades.push(Trade {
                 seller_index: seller_index as u32,
                 buyer_index: buyer_index as u32,
@@ -269,12 +338,15 @@ fn public_values(
     let mut output = Vec::with_capacity(256 + trades.len() * 72);
     output.extend_from_slice(b"RWA1");
     output.extend_from_slice(&input.chain_id.to_be_bytes());
+    output.extend_from_slice(&input.current_timestamp.to_be_bytes());
     output.extend_from_slice(&input.verifying_contract);
     output.extend_from_slice(&input.tfund);
     output.extend_from_slice(&input.usdc);
+    output.extend_from_slice(&input.identity_registry);
     output.extend_from_slice(domain_separator);
     output.extend_from_slice(&input.kyc_root);
     output.extend_from_slice(&orderbook_root(hashes));
+    output.extend_from_slice(&(hashes.len() as u32).to_be_bytes());
     output.extend_from_slice(&(trades.len() as u32).to_be_bytes());
     for trade in trades {
         output.extend_from_slice(&trade.seller_index.to_be_bytes());
@@ -291,12 +363,15 @@ pub fn main() {
         !input.orders.is_empty() && input.orders.len() <= MAX_ORDERS,
         "invalid order batch size"
     );
+    assert!(input.tfund != [0u8; 20], "zero TFUND address");
+    assert!(input.usdc != [0u8; 20], "zero settlement asset address");
+    assert!(input.identity_registry != [0u8; 20], "zero IdentityRegistry address");
+    assert!(input.kyc_root != [0u8; 32], "zero KYC root");
 
     let domain_separator = hash_domain(&input);
     let mut order_hashes = Vec::with_capacity(input.orders.len());
     for order in &input.orders {
         assert!(order.maker != [0u8; 20], "zero maker");
-        assert!(order.receiver != [0u8; 20], "zero receiver");
         assert!(
             (order.maker_asset == input.tfund && order.taker_asset == input.usdc)
                 || (order.maker_asset == input.usdc && order.taker_asset == input.tfund),
@@ -312,6 +387,7 @@ pub fn main() {
             order.maker,
             "invalid EIP-712 signature"
         );
+        assert!(order.kyc_proof.len() <= MAX_KYC_PROOF_DEPTH, "KYC Merkle proof is too deep");
         verify_kyc(&input.kyc_root, &order.maker, &order.kyc_proof);
         order_hashes.push(order_hash);
     }

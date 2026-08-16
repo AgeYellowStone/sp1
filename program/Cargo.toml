@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 sp1-zkvm = { path = "../crates/zkvm/entrypoint" }
+crypto-bigint = { version = "0.5.5", default-features = false }
 serde = { version = "1.0.204", features = ["derive"] }
 tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-6.2.0", features = ["keccak"] }
 k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.2.0", default-features = false, features = ["ecdsa"] }
