@@ -10,55 +10,84 @@ interface ISP1Verifier {
 }
 
 /// @title SP1BatchVerifier
-/// @notice Verifies an SP1 Plonk/Groth16 batch proof for the deployed RWA settlement.
-/// @dev The settlement contract is intentionally immutable. The current Stage 1
-///      deployment does not expose a batch-settlement entrypoint, so this adapter
-///      records a verified public-values digest for a settlement integration to consume.
+/// @notice Validates the canonical single-order public values used by the RWA settlement.
+/// @dev The settlement address and order assets are deployment parameters. No live
+///      address is embedded in the verifier bytecode.
 contract SP1BatchVerifier {
     error ZeroAddress();
     error ZeroProgramVKey();
     error MalformedPublicValues();
     error WrongChainId();
-    error StaleBatchTimestamp();
     error WrongSettlement();
+    error WrongRouter();
     error WrongTfund();
-    error WrongUsdc();
-    error WrongIdentityRegistry();
+    error WrongSettlementToken();
+    error WrongProgramVKey();
     error BatchNotVerified();
 
     event BatchProofVerified(bytes32 indexed batchDigest, address indexed settlement, bytes32 programVKey);
     event BatchConsumed(bytes32 indexed batchDigest, address indexed settlement);
 
-    address public constant ERC3643_LIMIT_ORDER_EXTENSION = 0xed281B3a066A5818FE119E33fb1e1719185a8a25;
-    address public constant TFUND = 0x4f955D0B96C20e88E5da6f632057e0BfA62c871e;
-    address public constant USDC = 0x17B9002eaeAeD3734C357C9662DEA5DD49aAA2cE;
-    address public constant IDENTITY_REGISTRY = 0xa8FAe60a6823A7e2EEe1e9dc73625537DE4E1ac6;
-    uint64 public constant CHAIN_ID = 421614;
+    uint256 public constant CHAIN_ID = 421614;
     address public immutable settlement;
+    address public immutable router;
+    address public immutable tfund;
+    address public immutable settlementToken;
     ISP1Verifier public immutable sp1Verifier;
     bytes32 public immutable programVKey;
     mapping(bytes32 batchDigest => bool verified) public verifiedBatches;
 
-    constructor(address _sp1Verifier, bytes32 _programVKey) {
-        if (_sp1Verifier == address(0)) revert ZeroAddress();
+    constructor(
+        address _settlement,
+        address _router,
+        address _tfund,
+        address _settlementToken,
+        address _sp1Verifier,
+        bytes32 _programVKey
+    ) {
+        if (
+            _settlement == address(0)
+                || _router == address(0)
+                || _tfund == address(0)
+                || _settlementToken == address(0)
+                || _sp1Verifier == address(0)
+        ) revert ZeroAddress();
+        if (
+            _settlement.code.length == 0
+                || _router.code.length == 0
+                || _tfund.code.length == 0
+                || _settlementToken.code.length == 0
+                || _sp1Verifier.code.length == 0
+        ) revert ZeroAddress();
         if (_programVKey == bytes32(0)) revert ZeroProgramVKey();
+
+        settlement = _settlement;
+        router = _router;
+        tfund = _tfund;
+        settlementToken = _settlementToken;
         sp1Verifier = ISP1Verifier(_sp1Verifier);
-        settlement = ERC3643_LIMIT_ORDER_EXTENSION;
         programVKey = _programVKey;
     }
 
-    /// @notice Verifies proof bytes and returns the digest committed by the batch.
+    /// @notice Succinct-compatible verifier entrypoint. Success is represented by no revert.
+    function verifyProof(bytes32 suppliedVKey, bytes calldata publicValues, bytes calldata proofBytes)
+        external
+        view
+    {
+        _verifyProof(suppliedVKey, publicValues, proofBytes);
+    }
+
+    /// @notice Verifies proof bytes and returns the committed public-values digest.
     function verifyBatch(bytes calldata proofBytes, bytes calldata publicValues)
         public
         view
         returns (bytes32 batchDigest)
     {
-        _validatePublicValues(publicValues);
-        sp1Verifier.verifyProof(programVKey, publicValues, proofBytes);
+        _verifyProof(programVKey, publicValues, proofBytes);
         return keccak256(publicValues);
     }
 
-    /// @notice Verifies and records a batch digest for the settlement integration.
+    /// @notice Records a verified digest for an integration that consumes it atomically.
     function recordVerifiedBatch(bytes calldata proofBytes, bytes calldata publicValues)
         external
         returns (bytes32 batchDigest)
@@ -68,9 +97,7 @@ contract SP1BatchVerifier {
         emit BatchProofVerified(batchDigest, settlement, programVKey);
     }
 
-    /// @notice Allows the configured settlement contract to consume a verified batch once.
-    /// @dev The Stage 1 extension is immutable and does not currently call this hook. A settlement
-    ///      upgrade can use it to make proof replay impossible after applying the matrix.
+    /// @notice Allows only the configured settlement contract to consume a digest once.
     function consumeVerifiedBatch(bytes32 batchDigest) external {
         if (msg.sender != settlement) revert WrongSettlement();
         if (!verifiedBatches[batchDigest]) revert BatchNotVerified();
@@ -78,44 +105,73 @@ contract SP1BatchVerifier {
         emit BatchConsumed(batchDigest, settlement);
     }
 
+    function _verifyProof(bytes32 suppliedVKey, bytes calldata publicValues, bytes calldata proofBytes)
+        internal
+        view
+    {
+        if (suppliedVKey != programVKey) revert WrongProgramVKey();
+        _validatePublicValues(publicValues);
+        sp1Verifier.verifyProof(programVKey, publicValues, proofBytes);
+    }
+
     function _validatePublicValues(bytes calldata publicValues) internal view {
-        // RWA1 || chainId || batchTimestamp || verifyingContract || tfund || usdc ||
-        // identityRegistry || domainSeparator || kycRoot || orderbookRoot || orderCount ||
-        // tradeCount.
-        if (publicValues.length < 204) revert MalformedPublicValues();
+        // abi.encode(chainId, router, orderHash, maker, logicalTaker,
+        //            makerAsset, takerAsset, makingAmount, takingAmount,
+        //            fillMakingAmount, fillTakingAmount, settlementNonce,
+        //            matchingCommitment)
+        if (publicValues.length != 13 * 32) revert MalformedPublicValues();
 
-        uint256 chainId;
-        uint256 batchTimestamp;
-        address verifyingContract;
-        address tfund;
-        address usdc;
-        address identityRegistry;
-        uint256 orderCount;
-        uint256 tradeCount;
-        uint256 magic;
-        assembly {
-            let offset := publicValues.offset
-            magic := shr(224, calldataload(offset))
-            chainId := shr(192, calldataload(add(offset, 4)))
-            batchTimestamp := shr(192, calldataload(add(offset, 12)))
-            verifyingContract := shr(96, calldataload(add(offset, 20)))
-            tfund := shr(96, calldataload(add(offset, 40)))
-            usdc := shr(96, calldataload(add(offset, 60)))
-            identityRegistry := shr(96, calldataload(add(offset, 80)))
-            orderCount := shr(224, calldataload(add(offset, 196)))
-            tradeCount := shr(224, calldataload(add(offset, 200)))
-        }
+        (
+            uint256 chainId,
+            address provenRouter,
+            bytes32 orderHash,
+            address maker,
+            address logicalTaker,
+            address makerAsset,
+            address takerAsset,
+            uint256 makingAmount,
+            uint256 takingAmount,
+            uint256 fillMakingAmount,
+            uint256 fillTakingAmount,
+            uint256 settlementNonce,
+            bytes32 matchingCommitment
+        ) = abi.decode(
+            publicValues,
+            (
+                uint256,
+                address,
+                bytes32,
+                address,
+                address,
+                address,
+                address,
+                uint256,
+                uint256,
+                uint256,
+                uint256,
+                uint256,
+                bytes32
+            )
+        );
 
-        if (magic != 0x52574131) revert MalformedPublicValues();
         if (chainId != CHAIN_ID) revert WrongChainId();
-        if (batchTimestamp < block.timestamp) revert StaleBatchTimestamp();
-        if (verifyingContract != settlement) revert WrongSettlement();
-        if (tfund != TFUND) revert WrongTfund();
-        if (usdc != USDC) revert WrongUsdc();
-        if (identityRegistry != IDENTITY_REGISTRY) revert WrongIdentityRegistry();
-        if (orderCount == 0 || orderCount > 64 || tradeCount == 0 || tradeCount > orderCount * orderCount) {
+        if (provenRouter != router) revert WrongRouter();
+        if (orderHash == bytes32(0) || maker == address(0) || logicalTaker == address(0)) {
             revert MalformedPublicValues();
         }
-        if (publicValues.length != 204 + tradeCount * 72) revert MalformedPublicValues();
+        if (makerAsset != tfund) revert WrongTfund();
+        if (takerAsset != settlementToken) revert WrongSettlementToken();
+        if (
+            makingAmount == 0
+                || takingAmount == 0
+                || fillMakingAmount == 0
+                || fillTakingAmount == 0
+                || matchingCommitment == bytes32(0)
+        ) revert MalformedPublicValues();
+
+        bytes32 expectedCommitment = keccak256(
+            abi.encodePacked(orderHash, logicalTaker, fillMakingAmount, settlementNonce)
+        );
+        if (matchingCommitment != expectedCommitment) revert MalformedPublicValues();
     }
 }

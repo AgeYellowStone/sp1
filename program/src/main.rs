@@ -2,18 +2,19 @@
 
 sp1_zkvm::entrypoint!(main);
 
-use crypto_bigint::{Encoding, NonZero, U256, U512};
+use crypto_bigint::{CheckedAdd, Encoding, NonZero, U256, U512};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher, Keccak};
 
-const MAX_ORDERS: usize = 64;
+const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421614;
 const MAX_KYC_PROOF_DEPTH: usize = 64;
 const ORDER_TYPE: &[u8] = b"Order(uint256 salt,address maker,address receiver,address makerAsset,address takerAsset,uint256 makingAmount,uint256 takingAmount,uint256 makerTraits)";
 const DOMAIN_TYPE: &[u8] =
     b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 const DOMAIN_NAME: &[u8] = b"1inch Limit Order Protocol";
 const DOMAIN_VERSION: &[u8] = b"4";
+const PHASE1_SIGNATURE_ERROR: &str = "Only EOA secp256k1 signatures supported in Phase 1";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Order {
@@ -30,23 +31,16 @@ pub struct Order {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct BatchInput {
+pub struct ProofInput {
     pub chain_id: u64,
-    pub verifying_contract: [u8; 20],
+    pub router: [u8; 20],
+    pub logical_taker: [u8; 20],
     pub tfund: [u8; 20],
-    pub usdc: [u8; 20],
-    pub identity_registry: [u8; 20],
+    pub settlement_token: [u8; 20],
     pub kyc_root: [u8; 32],
     pub current_timestamp: u64,
-    pub orders: Vec<Order>,
-}
-
-#[derive(Clone, Copy)]
-struct Trade {
-    seller_index: u32,
-    buyer_index: u32,
-    tfund_amount: U256,
-    usdc_amount: U256,
+    pub fill_making_amount: [u8; 32],
+    pub order: Order,
 }
 
 fn keccak256(bytes: &[u8]) -> [u8; 32] {
@@ -69,16 +63,13 @@ fn uint64_word(value: u64) -> [u8; 32] {
     word
 }
 
-fn hash_domain(input: &BatchInput) -> [u8; 32] {
-    let domain_type_hash = keccak256(DOMAIN_TYPE);
-    let name_hash = keccak256(DOMAIN_NAME);
-    let version_hash = keccak256(DOMAIN_VERSION);
+fn hash_domain(input: &ProofInput) -> [u8; 32] {
     let mut encoded = Vec::with_capacity(160);
-    encoded.extend_from_slice(&domain_type_hash);
-    encoded.extend_from_slice(&name_hash);
-    encoded.extend_from_slice(&version_hash);
+    encoded.extend_from_slice(&keccak256(DOMAIN_TYPE));
+    encoded.extend_from_slice(&keccak256(DOMAIN_NAME));
+    encoded.extend_from_slice(&keccak256(DOMAIN_VERSION));
     encoded.extend_from_slice(&uint64_word(input.chain_id));
-    encoded.extend_from_slice(&address_word(&input.verifying_contract));
+    encoded.extend_from_slice(&address_word(&input.router));
     keccak256(&encoded)
 }
 
@@ -120,13 +111,18 @@ fn recover_maker(order_hash: &[u8; 32], signature: &[u8]) -> [u8; 20] {
             signature_bytes[32] &= 0x7f;
             recovery_byte
         }
-        _ => panic!("signature must be 64 or 65 bytes"),
+        _ => panic!("Only EOA secp256k1 signatures supported in Phase 1"),
     };
-    assert!(recovery_byte <= 1, "invalid Ethereum recovery id");
-    let signature = Signature::from_slice(&signature_bytes).unwrap();
-    let recovery_id = RecoveryId::from_byte(recovery_byte).unwrap();
-    let verifying_key =
-        VerifyingKey::recover_from_prehash(order_hash, &signature, recovery_id).unwrap();
+    assert!(recovery_byte <= 1, "Only EOA secp256k1 signatures supported in Phase 1");
+    let signature = Signature::from_slice(&signature_bytes)
+        .unwrap_or_else(|_| panic!("Only EOA secp256k1 signatures supported in Phase 1"));
+    if signature.normalize_s().is_some() {
+        panic!("Only EOA secp256k1 signatures supported in Phase 1");
+    }
+    let recovery_id = RecoveryId::from_byte(recovery_byte)
+        .unwrap_or_else(|| panic!("Only EOA secp256k1 signatures supported in Phase 1"));
+    let verifying_key = VerifyingKey::recover_from_prehash(order_hash, &signature, recovery_id)
+        .unwrap_or_else(|_| panic!("Only EOA secp256k1 signatures supported in Phase 1"));
     let encoded_key = verifying_key.to_encoded_point(false);
     let digest = keccak256(&encoded_key.as_bytes()[1..]);
     digest[12..].try_into().unwrap()
@@ -152,10 +148,6 @@ fn amount(word: &[u8; 32]) -> U256 {
     U256::from_be_slice(word)
 }
 
-fn amount_word(value: U256) -> [u8; 32] {
-    value.to_be_bytes()
-}
-
 fn widen(value: U256) -> U512 {
     let mut bytes = [0u8; 64];
     bytes[32..].copy_from_slice(&value.to_be_bytes());
@@ -170,33 +162,20 @@ fn narrow(value: U512) -> Option<U256> {
     Some(U256::from_be_slice(&bytes[32..]))
 }
 
-fn product(left: U256, right: U256) -> U512 {
-    left.mul(&right)
-}
-
-fn floor_ratio(numerator: U256, multiplier: U256, denominator: U256) -> Option<U256> {
-    assert!(denominator != U256::ZERO, "division by zero");
-    let (quotient, _) =
-        product(numerator, multiplier).div_rem(&NonZero::new(widen(denominator)).unwrap());
-    narrow(quotient)
-}
-
-fn ceil_ratio(numerator: U256, multiplier: U256, denominator: U256) -> Option<U256> {
-    assert!(denominator != U256::ZERO, "division by zero");
-    let (mut quotient, remainder) =
-        product(numerator, multiplier).div_rem(&NonZero::new(widen(denominator)).unwrap());
+/// Mirrors AmountCalculatorLib.getTakingAmount using a full-width intermediate.
+fn get_taking_amount(
+    order_making_amount: U256,
+    order_taking_amount: U256,
+    fill_making_amount: U256,
+) -> U256 {
+    assert!(order_making_amount != U256::ZERO, "division by zero");
+    let (mut quotient, remainder) = fill_making_amount
+        .mul(&order_taking_amount)
+        .div_rem(&NonZero::new(widen(order_making_amount)).unwrap());
     if remainder != U512::ZERO {
-        quotient = quotient + U512::ONE;
+        quotient = quotient.checked_add(&U512::ONE).expect("amount arithmetic overflow");
     }
-    narrow(quotient)
-}
-
-fn min_amount(left: U256, right: U256) -> U256 {
-    if left < right {
-        left
-    } else {
-        right
-    }
+    narrow(quotient).expect("amount overflow")
 }
 
 fn expiration(maker_traits: &[u8; 32]) -> u64 {
@@ -212,187 +191,130 @@ fn expiration(maker_traits: &[u8; 32]) -> u64 {
     ])
 }
 
-fn sorted_pair_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
-    let mut pair = [0u8; 64];
-    if left <= right {
-        pair[..32].copy_from_slice(&left);
-        pair[32..].copy_from_slice(&right);
-    } else {
-        pair[..32].copy_from_slice(&right);
-        pair[32..].copy_from_slice(&left);
-    }
-    keccak256(&pair)
+fn nonce_or_epoch(maker_traits: &[u8; 32]) -> U256 {
+    // MakerTraitsLib stores nonceOrEpoch in bits 120..159 (five bytes).
+    let mut word = [0u8; 32];
+    word[27..32].copy_from_slice(&maker_traits[12..17]);
+    U256::from_be_slice(&word)
 }
 
-fn orderbook_root(hashes: &[[u8; 32]]) -> [u8; 32] {
-    if hashes.is_empty() {
-        return [0u8; 32];
+fn check_allowed_sender(maker_traits: &[u8; 32], logical_taker: &[u8; 20]) {
+    // 1inch MakerTraits uses the low 80 bits for allowedSender, not a full address.
+    let allowed_sender = &maker_traits[22..32];
+    if allowed_sender.iter().any(|byte| *byte != 0) {
+        assert_eq!(
+            allowed_sender,
+            &logical_taker[10..20],
+            "Taker is not the allowed private recipient"
+        );
     }
-    let mut level = hashes.to_vec();
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
-        let mut index = 0;
-        while index < level.len() {
-            let right = if index + 1 < level.len() { level[index + 1] } else { level[index] };
-            next.push(sorted_pair_hash(level[index], right));
-            index += 2;
-        }
-        level = next;
-    }
-    level[0]
 }
 
-fn build_trades(input: &BatchInput, orders: &[Order]) -> Vec<Trade> {
-    let order_count = orders.len();
-    let mut remaining_maker =
-        orders.iter().map(|order| amount(&order.making_amount)).collect::<Vec<_>>();
-    let mut remaining_taker =
-        orders.iter().map(|order| amount(&order.taking_amount)).collect::<Vec<_>>();
-    let mut trades = Vec::new();
-
-    for seller_index in 0..order_count {
-        let seller = &orders[seller_index];
-        if seller.maker_asset != input.tfund || seller.taker_asset != input.usdc {
-            continue;
-        }
-        let seller_making = amount(&seller.making_amount);
-        let seller_taking = amount(&seller.taking_amount);
-        assert!(seller_making > U256::ZERO && seller_taking > U256::ZERO);
-
-        for buyer_index in 0..order_count {
-            let buyer = &orders[buyer_index];
-            if buyer.maker_asset != input.usdc
-                || buyer.taker_asset != input.tfund
-                || seller_index == buyer_index
-            {
-                continue;
-            }
-            let buyer_making = amount(&buyer.making_amount);
-            let buyer_taking = amount(&buyer.taking_amount);
-            if buyer_making == U256::ZERO
-                || buyer_taking == U256::ZERO
-                || remaining_maker[seller_index] == U256::ZERO
-                || remaining_taker[buyer_index] == U256::ZERO
-            {
-                continue;
-            }
-
-            // Seller ask <= buyer bid. All arithmetic is checked before entering the proof.
-            let ask_value = product(seller_taking, buyer_taking);
-            let bid_value = product(buyer_making, seller_making);
-            if ask_value > bid_value {
-                continue;
-            }
-
-            let Some(seller_tfund_capacity) =
-                floor_ratio(remaining_taker[seller_index], seller_making, seller_taking)
-            else {
-                continue;
-            };
-            let Some(buyer_tfund_capacity) =
-                floor_ratio(remaining_maker[buyer_index], buyer_taking, buyer_making)
-            else {
-                continue;
-            };
-            let tfund_amount = min_amount(
-                min_amount(remaining_maker[seller_index], remaining_taker[buyer_index]),
-                min_amount(seller_tfund_capacity, buyer_tfund_capacity),
-            );
-            if tfund_amount == U256::ZERO {
-                continue;
-            }
-
-            let Some(usdc_amount) = ceil_ratio(tfund_amount, seller_taking, seller_making) else {
-                continue;
-            };
-            if usdc_amount == U256::ZERO
-                || usdc_amount > remaining_maker[buyer_index]
-                || usdc_amount > remaining_taker[seller_index]
-            {
-                continue;
-            }
-
-            remaining_maker[seller_index] =
-                remaining_maker[seller_index].wrapping_sub(&tfund_amount);
-            remaining_taker[seller_index] =
-                remaining_taker[seller_index].wrapping_sub(&usdc_amount);
-            remaining_taker[buyer_index] = remaining_taker[buyer_index].wrapping_sub(&tfund_amount);
-            remaining_maker[buyer_index] = remaining_maker[buyer_index].wrapping_sub(&usdc_amount);
-            trades.push(Trade {
-                seller_index: seller_index as u32,
-                buyer_index: buyer_index as u32,
-                tfund_amount,
-                usdc_amount,
-            });
-        }
-    }
-    trades
+fn matching_commitment(
+    order_hash: &[u8; 32],
+    logical_taker: &[u8; 20],
+    fill_making_amount: U256,
+    settlement_nonce: U256,
+) -> [u8; 32] {
+    // Keep this byte layout identical to abi.encodePacked(bytes32,address,uint256,uint256).
+    let mut encoded = Vec::with_capacity(32 + 20 + 32 + 32);
+    encoded.extend_from_slice(order_hash);
+    encoded.extend_from_slice(logical_taker);
+    encoded.extend_from_slice(&fill_making_amount.to_be_bytes());
+    encoded.extend_from_slice(&settlement_nonce.to_be_bytes());
+    keccak256(&encoded)
 }
 
 fn public_values(
-    input: &BatchInput,
-    hashes: &[[u8; 32]],
-    trades: &[Trade],
-    domain_separator: &[u8; 32],
+    input: &ProofInput,
+    order_hash: &[u8; 32],
+    fill_making_amount: U256,
+    fill_taking_amount: U256,
+    settlement_nonce: U256,
+    commitment: &[u8; 32],
 ) -> Vec<u8> {
-    let mut output = Vec::with_capacity(256 + trades.len() * 72);
-    output.extend_from_slice(b"RWA1");
-    output.extend_from_slice(&input.chain_id.to_be_bytes());
-    output.extend_from_slice(&input.current_timestamp.to_be_bytes());
-    output.extend_from_slice(&input.verifying_contract);
-    output.extend_from_slice(&input.tfund);
-    output.extend_from_slice(&input.usdc);
-    output.extend_from_slice(&input.identity_registry);
-    output.extend_from_slice(domain_separator);
-    output.extend_from_slice(&input.kyc_root);
-    output.extend_from_slice(&orderbook_root(hashes));
-    output.extend_from_slice(&(hashes.len() as u32).to_be_bytes());
-    output.extend_from_slice(&(trades.len() as u32).to_be_bytes());
-    for trade in trades {
-        output.extend_from_slice(&trade.seller_index.to_be_bytes());
-        output.extend_from_slice(&trade.buyer_index.to_be_bytes());
-        output.extend_from_slice(&amount_word(trade.tfund_amount));
-        output.extend_from_slice(&amount_word(trade.usdc_amount));
-    }
+    let order = &input.order;
+    let mut output = Vec::with_capacity(13 * 32);
+    output.extend_from_slice(&uint64_word(input.chain_id));
+    output.extend_from_slice(&address_word(&input.router));
+    output.extend_from_slice(order_hash);
+    output.extend_from_slice(&address_word(&order.maker));
+    output.extend_from_slice(&address_word(&input.logical_taker));
+    output.extend_from_slice(&address_word(&order.maker_asset));
+    output.extend_from_slice(&address_word(&order.taker_asset));
+    output.extend_from_slice(&order.making_amount);
+    output.extend_from_slice(&order.taking_amount);
+    output.extend_from_slice(&fill_making_amount.to_be_bytes());
+    output.extend_from_slice(&fill_taking_amount.to_be_bytes());
+    output.extend_from_slice(&settlement_nonce.to_be_bytes());
+    output.extend_from_slice(commitment);
     output
 }
 
 pub fn main() {
-    let input: BatchInput = sp1_zkvm::io::read();
-    assert!(
-        !input.orders.is_empty() && input.orders.len() <= MAX_ORDERS,
-        "invalid order batch size"
-    );
+    let input: ProofInput = sp1_zkvm::io::read();
+    assert_eq!(input.chain_id, ARBITRUM_SEPOLIA_CHAIN_ID, "wrong chain");
+    assert!(input.router != [0u8; 20], "zero router address");
+    assert!(input.logical_taker != [0u8; 20], "zero logical taker");
     assert!(input.tfund != [0u8; 20], "zero TFUND address");
-    assert!(input.usdc != [0u8; 20], "zero settlement asset address");
-    assert!(input.identity_registry != [0u8; 20], "zero IdentityRegistry address");
+    assert!(input.settlement_token != [0u8; 20], "zero settlement token address");
     assert!(input.kyc_root != [0u8; 32], "zero KYC root");
 
-    let domain_separator = hash_domain(&input);
-    let mut order_hashes = Vec::with_capacity(input.orders.len());
-    for order in &input.orders {
-        assert!(order.maker != [0u8; 20], "zero maker");
-        assert!(
-            (order.maker_asset == input.tfund && order.taker_asset == input.usdc)
-                || (order.maker_asset == input.usdc && order.taker_asset == input.tfund),
-            "unsupported asset pair"
-        );
-        let expiry = expiration(&order.maker_traits);
-        if input.current_timestamp != 0 && expiry != 0 {
-            assert!(input.current_timestamp <= expiry, "order expired");
-        }
-        let order_hash = hash_order(order, &domain_separator);
-        assert_eq!(
-            recover_maker(&order_hash, &order.signature),
-            order.maker,
-            "invalid EIP-712 signature"
-        );
-        assert!(order.kyc_proof.len() <= MAX_KYC_PROOF_DEPTH, "KYC Merkle proof is too deep");
-        verify_kyc(&input.kyc_root, &order.maker, &order.kyc_proof);
-        order_hashes.push(order_hash);
+    let order = &input.order;
+    assert!(order.maker != [0u8; 20], "zero maker");
+    assert!(order.maker_asset == input.tfund, "wrong maker asset");
+    assert!(order.taker_asset == input.settlement_token, "wrong taker asset");
+    assert!(amount(&order.making_amount) != U256::ZERO, "zero making amount");
+    assert!(amount(&order.taking_amount) != U256::ZERO, "zero taking amount");
+
+    check_allowed_sender(&order.maker_traits, &input.logical_taker);
+
+    let fill_making_amount = amount(&input.fill_making_amount);
+    assert!(fill_making_amount != U256::ZERO, "zero fill making amount");
+    assert!(fill_making_amount <= amount(&order.making_amount), "fill exceeds order making amount");
+    if order.maker_traits[0] & 0x80 != 0 {
+        assert_eq!(fill_making_amount, amount(&order.making_amount), "partial fill is disabled");
     }
 
-    let trades = build_trades(&input, &input.orders);
-    assert!(!trades.is_empty(), "order batch has no crossing prices");
-    sp1_zkvm::io::commit_slice(&public_values(&input, &order_hashes, &trades, &domain_separator));
+    let expiry = expiration(&order.maker_traits);
+    if input.current_timestamp != 0 && expiry != 0 {
+        assert!(input.current_timestamp <= expiry, "order expired");
+    }
+
+    let domain_separator = hash_domain(&input);
+    let order_hash = hash_order(order, &domain_separator);
+    assert_eq!(
+        recover_maker(&order_hash, &order.signature),
+        order.maker,
+        "{}",
+        PHASE1_SIGNATURE_ERROR
+    );
+    assert!(order.kyc_proof.len() <= MAX_KYC_PROOF_DEPTH, "KYC Merkle proof is too deep");
+    verify_kyc(&input.kyc_root, &order.maker, &order.kyc_proof);
+
+    let fill_taking_amount = get_taking_amount(
+        amount(&order.making_amount),
+        amount(&order.taking_amount),
+        fill_making_amount,
+    );
+    assert!(fill_taking_amount != U256::ZERO, "zero fill taking amount");
+    assert!(fill_taking_amount <= amount(&order.taking_amount), "fill exceeds order taking amount");
+
+    // nonceOrEpoch is part of the signed makerTraits, so it cannot be chosen
+    // independently for a replay with a different matching commitment.
+    let settlement_nonce = nonce_or_epoch(&order.maker_traits);
+    let commitment = matching_commitment(
+        &order_hash,
+        &input.logical_taker,
+        fill_making_amount,
+        settlement_nonce,
+    );
+    sp1_zkvm::io::commit_slice(&public_values(
+        &input,
+        &order_hash,
+        fill_making_amount,
+        fill_taking_amount,
+        settlement_nonce,
+        &commitment,
+    ));
 }
