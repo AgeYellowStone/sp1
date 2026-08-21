@@ -10,7 +10,7 @@ interface ISP1Verifier {
 }
 
 /// @title SP1BatchVerifier
-/// @notice Validates the canonical single-order public values used by the RWA settlement.
+/// @notice Validates the canonical packed public values used by batch settlement.
 /// @dev The settlement address and order assets are deployment parameters. No live
 ///      address is embedded in the verifier bytecode.
 contract SP1BatchVerifier {
@@ -20,8 +20,6 @@ contract SP1BatchVerifier {
     error WrongChainId();
     error WrongSettlement();
     error WrongRouter();
-    error WrongTfund();
-    error WrongSettlementToken();
     error WrongProgramVKey();
     error BatchNotVerified();
 
@@ -29,10 +27,11 @@ contract SP1BatchVerifier {
     event BatchConsumed(bytes32 indexed batchDigest, address indexed settlement);
 
     uint256 public constant CHAIN_ID = 421614;
+    uint256 public constant MAX_ORDERS = 128;
+    uint256 public constant MAX_TRADES = 256;
     address public immutable settlement;
     address public immutable router;
-    address public immutable tfund;
-    address public immutable settlementToken;
+    address public immutable identityRegistry;
     ISP1Verifier public immutable sp1Verifier;
     bytes32 public immutable programVKey;
     mapping(bytes32 batchDigest => bool verified) public verifiedBatches;
@@ -40,31 +39,27 @@ contract SP1BatchVerifier {
     constructor(
         address _settlement,
         address _router,
-        address _tfund,
-        address _settlementToken,
+        address _identityRegistry,
         address _sp1Verifier,
         bytes32 _programVKey
     ) {
         if (
             _settlement == address(0)
                 || _router == address(0)
-                || _tfund == address(0)
-                || _settlementToken == address(0)
+                || _identityRegistry == address(0)
                 || _sp1Verifier == address(0)
         ) revert ZeroAddress();
         if (
             _settlement.code.length == 0
                 || _router.code.length == 0
-                || _tfund.code.length == 0
-                || _settlementToken.code.length == 0
+                || _identityRegistry.code.length == 0
                 || _sp1Verifier.code.length == 0
         ) revert ZeroAddress();
         if (_programVKey == bytes32(0)) revert ZeroProgramVKey();
 
         settlement = _settlement;
         router = _router;
-        tfund = _tfund;
-        settlementToken = _settlementToken;
+        identityRegistry = _identityRegistry;
         sp1Verifier = ISP1Verifier(_sp1Verifier);
         programVKey = _programVKey;
     }
@@ -115,63 +110,48 @@ contract SP1BatchVerifier {
     }
 
     function _validatePublicValues(bytes calldata publicValues) internal view {
-        // abi.encode(chainId, router, orderHash, maker, logicalTaker,
-        //            makerAsset, takerAsset, makingAmount, takingAmount,
-        //            fillMakingAmount, fillTakingAmount, settlementNonce,
-        //            matchingCommitment)
-        if (publicValues.length != 13 * 32) revert MalformedPublicValues();
-
-        (
-            uint256 chainId,
-            address provenRouter,
-            bytes32 orderHash,
-            address maker,
-            address logicalTaker,
-            address makerAsset,
-            address takerAsset,
-            uint256 makingAmount,
-            uint256 takingAmount,
-            uint256 fillMakingAmount,
-            uint256 fillTakingAmount,
-            uint256 settlementNonce,
-            bytes32 matchingCommitment
-        ) = abi.decode(
-            publicValues,
-            (
-                uint256,
-                address,
-                bytes32,
-                address,
-                address,
-                address,
-                address,
-                uint256,
-                uint256,
-                uint256,
-                uint256,
-                uint256,
-                bytes32
-            )
-        );
-
-        if (chainId != CHAIN_ID) revert WrongChainId();
-        if (provenRouter != router) revert WrongRouter();
-        if (orderHash == bytes32(0) || maker == address(0) || logicalTaker == address(0)) {
-            revert MalformedPublicValues();
+        // RWA1 | chainId(8) | timestamp(8) | settlement(20) | router(20) |
+        // identityRegistry(20) | kycRoot | orderbookRoot | orderCount(4) |
+        // tradeCount(4) | tradesHash.
+        if (publicValues.length != 184) revert MalformedPublicValues();
+        uint256 offset;
+        uint256 chainId;
+        uint256 batchTimestamp;
+        address provenSettlement;
+        address provenRouter;
+        address identityRegistry;
+        bytes32 kycRoot;
+        bytes32 orderbookRoot;
+        uint256 orderCount;
+        uint256 tradeCount;
+        bytes32 tradesHash;
+        assembly {
+            offset := publicValues.offset
+            if iszero(eq(shr(224, calldataload(offset)), 0x52574131)) { revert(0, 0) }
+            chainId := shr(192, calldataload(add(offset, 4)))
+            batchTimestamp := shr(192, calldataload(add(offset, 12)))
+            provenSettlement := shr(96, calldataload(add(offset, 20)))
+            provenRouter := shr(96, calldataload(add(offset, 40)))
+            identityRegistry := shr(96, calldataload(add(offset, 60)))
+            kycRoot := calldataload(add(offset, 80))
+            orderbookRoot := calldataload(add(offset, 112))
+            orderCount := shr(224, calldataload(add(offset, 144)))
+            tradeCount := shr(224, calldataload(add(offset, 148)))
+            tradesHash := calldataload(add(offset, 152))
         }
-        if (makerAsset != tfund) revert WrongTfund();
-        if (takerAsset != settlementToken) revert WrongSettlementToken();
+        if (chainId != block.chainid || chainId != CHAIN_ID) revert WrongChainId();
+        if (batchTimestamp == 0 || batchTimestamp > block.timestamp) revert MalformedPublicValues();
+        if (provenSettlement != settlement) revert WrongSettlement();
+        if (provenRouter != router) revert WrongRouter();
         if (
-            makingAmount == 0
-                || takingAmount == 0
-                || fillMakingAmount == 0
-                || fillTakingAmount == 0
-                || matchingCommitment == bytes32(0)
+            identityRegistry != address(this.identityRegistry)
+                || kycRoot == bytes32(0)
+                || orderbookRoot == bytes32(0)
+                || tradesHash == bytes32(0)
+                || orderCount == 0
+                || orderCount > MAX_ORDERS
+                || tradeCount == 0
+                || tradeCount > MAX_TRADES
         ) revert MalformedPublicValues();
-
-        bytes32 expectedCommitment = keccak256(
-            abi.encodePacked(orderHash, logicalTaker, fillMakingAmount, settlementNonce)
-        );
-        if (matchingCommitment != expectedCommitment) revert MalformedPublicValues();
     }
 }

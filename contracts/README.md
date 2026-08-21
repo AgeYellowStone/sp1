@@ -1,45 +1,28 @@
-# SP1 Settlement Verifier
+# SP1 Batch Settlement Verifier
 
-`SP1BatchVerifier.sol` is a deployment-parameterized adapter for the canonical
-RWA order settlement. It receives the settlement, 1inch router, TFUND,
-settlement-token, official Succinct verifier, and generated program vKey in its
-constructor. No live settlement address is embedded in the bytecode.
-
-It exposes the exact Succinct SP1 ABI:
-
-```solidity
-verifyProof(bytes32 programVKey, bytes publicValues, bytes proofBytes)
-```
-
-The function has no return value. A valid proof returns normally; an invalid proof
-reverts. The adapter also retains the optional digest recording/consumption hook,
-which is restricted to the configured settlement address.
+`SP1BatchVerifier.sol` is a deployment-parameterized Succinct adapter for the
+batch matching-engine proof. It validates the packed public-values header and
+then forwards the exact `verifyProof(bytes32,bytes,bytes)` call to the official
+SP1 verifier. `verifiedBatches` records a `keccak256(publicValues)` digest for
+settlement integrations that consume proof results separately.
 
 ## Public Values
 
-The guest commits `abi.encode`-compatible static words:
+The guest and Solidity batch settlement use the same 184-byte layout:
 
-| Word | Field |
-| ---: | --- |
-| 0 | `uint256 chainId` |
-| 1 | `address router` |
-| 2 | `bytes32 orderHash` |
-| 3 | `address maker` |
-| 4 | `address logicalTaker` |
-| 5 | `address makerAsset` |
-| 6 | `address takerAsset` |
-| 7 | `uint256 makingAmount` |
-| 8 | `uint256 takingAmount` |
-| 9 | `uint256 fillMakingAmount` |
-| 10 | `uint256 fillTakingAmount` |
-| 11 | `uint256 settlementNonce` (`makerTraits.nonceOrEpoch()`) |
-| 12 | `bytes32 matchingCommitment` |
+```text
+RWA1(4) |
+chainId(8) |
+batchTimestamp(8) |
+verifyingContract(20) |
+limitOrderProtocol(20) |
+identityRegistry(20) |
+kycRoot(32) |
+orderbookRoot(32) |
+orderCount(4) |
+tradeCount(4) |
+tradesHash(32)
+```
 
-The total public value length is exactly `13 * 32 = 416` bytes. The guest verifies
-the 1inch EIP-712 order hash, recoverable secp256k1 signature, order expiry,
-asset pair, private-order recipient, 512-bit checked fill ratio, and a bounded
-Merkle witness before committing this output. Phase 1 accepts only EOA
-secp256k1 signatures; EIP-1271 contract wallets are reserved for Phase 2. The
-settlement wrapper additionally binds every word to the calldata order,
-consumes the matching commitment once, and performs authoritative live
-`IdentityRegistry.isVerified` checks for maker and logical taker.
+`tradesHash` is `keccak256(abi.encode(TradeSettlement[]))`. The settlement
+contract compares it with its calldata array before any token transfer.
