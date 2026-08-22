@@ -67,8 +67,13 @@ if [[ ! -f "fixtures/batch_${BATCH_SIZE}.json" ]]; then
   cargo run --release --no-default-features --bin gen_fixtures
 fi
 
-echo "building prove host (SP1 guest via build.rs)"
-cargo build --release --bin prove --features sp1
+PROVE_FEATURES="sp1"
+if [[ "${SP1_PROVER}" == "cuda" ]]; then
+  PROVE_FEATURES="sp1,cuda"
+fi
+
+echo "building prove host (SP1 guest via build.rs) features=${PROVE_FEATURES}"
+cargo build --release --bin prove --features "${PROVE_FEATURES}"
 
 export BATCH_INPUT_PATH="${SP1_SCRIPT}/fixtures/batch_${BATCH_SIZE}.json"
 export SP1_PROOF_MODE
@@ -77,8 +82,8 @@ export SP1_OUTPUT_DIR="${SP1_SCRIPT}/proofs/batch_${BATCH_SIZE}"
 unset PREFLIGHT_RPC_URL || true
 unset ETH_RPC_URL || true
 
-echo "proving batch_${BATCH_SIZE} mode=${SP1_PROOF_MODE} prover=${SP1_PROVER}"
-cargo run --release --bin prove --features sp1
+echo "proving batch_${BATCH_SIZE} mode=${SP1_PROOF_MODE} prover=${SP1_PROVER} features=${PROVE_FEATURES}"
+cargo run --release --bin prove --features "${PROVE_FEATURES}"
 
 PUBLIC_VALUES="${SP1_OUTPUT_DIR}/public-values.bin"
 CALLDATA_JSON="${SP1_OUTPUT_DIR}/batch_settlement_calldata.json"

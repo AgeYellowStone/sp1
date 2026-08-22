@@ -9,6 +9,7 @@ publish = false
 [features]
 default = ["sp1"]
 sp1 = ["dep:sp1-sdk", "dep:sp1-build"]
+cuda = ["sp1-sdk/cuda"]
 
 [dependencies]
 async-trait = "0.1.89"

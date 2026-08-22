@@ -4,7 +4,8 @@ use std::{
     time::Instant,
 };
 
-use sp1_sdk::{include_elf, HashableKey, Prover, ProverClient, SP1Stdin};
+use sp1_sdk::prelude::*;
+use sp1_sdk::ProverClient;
 
 use rwa_dex_batch_script::{
     codec::{self, batch_settlement_calldata_file, encode_public_values},
